@@ -1,187 +1,180 @@
-#include <Windows.h>
 #include <iostream>
-#include <string>
-#include <vector>
+#include <Windows.h>
 #include <Psapi.h>
-#include <sstream>
-#include <SetupAPI.h>
-#include <locale>
-#include <codecvt>
+#include <string>
 #include <random>
-#include <cstdint>
+#include <vector>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <fstream>
 
-#pragma comment(lib, "SetupAPI.lib")
-#pragma comment(lib, "Psapi.lib")
-
-std::string wstring_to_string(const std::wstring& wstr) {
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    return converter.to_bytes(wstr);
+std::wstring GetDriverPath(const std::wstring& driverName) {
+    return L"\\\\.\\" + driverName;
 }
 
-std::vector<std::string> SplitString(const std::string& str, char delimiter) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(str);
-    while (std::getline(tokenStream, token, delimiter)) {
-        tokens.push_back(token);
-    }
-    return tokens;
+DWORD GenerateRandomIOCTL() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<DWORD> dist(0x00000000, 0xCCCCCCCC);
+    return dist(gen);
 }
 
-std::vector<std::string> EnumerateLoadedDeviceDriverIDs() {
-    std::vector<std::string> driverIDs;
-    HMODULE drivers[1024];
-    DWORD cbNeeded;
+std::vector<BYTE> GenerateRandomBuffer(size_t bufferSize) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> byteDist(0x00, 0xFF);
 
-    if (EnumDeviceDrivers(reinterpret_cast<LPVOID*>(drivers), sizeof(drivers), &cbNeeded)) {
-        TCHAR driverPath[MAX_PATH];
-        DWORD numDrivers = cbNeeded / sizeof(drivers[0]);
-
-        for (DWORD i = 0; i < numDrivers; ++i) {
-            MODULEINFO moduleInfo;
-            if (GetModuleInformation(GetCurrentProcess(), drivers[i], &moduleInfo, sizeof(moduleInfo))) {
-                TCHAR moduleName[MAX_PATH];
-                if (GetModuleFileNameEx(GetCurrentProcess(), drivers[i], moduleName, sizeof(moduleName) / sizeof(moduleName[0]))) {
-                    std::wstring moduleNameStr(moduleName);
-                    std::string moduleNameUtf8 = wstring_to_string(moduleNameStr);
-                    driverIDs.push_back(moduleNameUtf8);
-                }
-            }
-        }
-    }
-    else {
-        throw std::runtime_error("Failed to enumerate loaded device driver IDs.");
+    std::vector<BYTE> buffer(bufferSize);
+    for (size_t i = 0; i < bufferSize; i++) {
+        buffer[i] = static_cast<BYTE>(byteDist(gen));
     }
 
-    return driverIDs;
+    return buffer;
 }
 
-std::string GetDriverName(const std::string& hardwareID) {
-    std::vector<std::string> parts = SplitString(hardwareID, '\\');
-    if (!parts.empty()) {
-        return parts[0];
+LONG WINAPI FuzzHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+    std::wofstream logfile("log.txt", std::ios::app);
+    if (logfile.is_open()) {
+        logfile << L"Access violation occurred with code: " << ExceptionInfo->ExceptionRecord->ExceptionCode << std::endl;
+        logfile.close();
     }
-    return "";
+    // Handle the exception gracefully, e.g., log the error, recover if possible
+    return EXCEPTION_CONTINUE_SEARCH; // or EXCEPTION_EXECUTE_HANDLER if you want to suppress the exception
 }
 
-bool IsDriverOwnedByNT(const std::string& driverName) {
-    return driverName.find("nt") == 0;
-}
+std::mutex printMutex;
 
-bool IsDriverSkippable(const std::string& driverName) {
-    if (driverName == "hwpolicy") {
+bool IsIOCTLValid(HANDLE hDevice, DWORD ioctlCode, const std::vector<BYTE>& inputBuffer, std::vector<BYTE>& outputBuffer) {
+    DWORD bytesReturned;
+    if (DeviceIoControl(
+        hDevice,
+        ioctlCode,
+        const_cast<BYTE*>(inputBuffer.data()),
+        static_cast<DWORD>(inputBuffer.size()),
+        outputBuffer.data(),
+        static_cast<DWORD>(outputBuffer.size()),
+        &bytesReturned,
+        nullptr))
+    {
         return true;
     }
     return false;
 }
 
-std::random_device rdGlobal;
-std::mt19937 genGlobal(rdGlobal());
-std::uniform_int_distribution<unsigned int> byteDistGlobal(0, 255);
+void FuzzDriver(const TCHAR* driverPath, size_t bufferSize) {
+    const int maxAttempts = 10;  // Increase the number of attempts
+    const int delayMs = 1000;  // Delay between attempts (1 second)
 
-void FuzzIOCTL(const std::string& driverID) {
-    // Open the device with the driver ID
-    std::string devicePath = "\\\\.\\";
-    devicePath += driverID;
-    HANDLE hDevice = CreateFileA(devicePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        HANDLE hDevice = CreateFile(
+            driverPath,
+            GENERIC_READ | GENERIC_WRITE,
+            0,  // Exclusive access
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
 
-    if (hDevice == INVALID_HANDLE_VALUE) {
-        std::cerr << "Failed to open the device for driver ID: " << driverID << ". Error code: " << GetLastError() << std::endl;
-        return;
-    }
-    std::cout << "Successfully opened the device for driver ID: " << driverID << std::endl;
+        if (hDevice != INVALID_HANDLE_VALUE) {
+            try {
+                std::vector<BYTE> inputBuffer(bufferSize);  // Allocate input buffer
+                std::vector<BYTE> outputBuffer(bufferSize);  // Allocate output buffer
 
-    DWORD_PTR minAddress = 0x00000000;
-    DWORD_PTR maxAddress = 0xFFFFFFFFFFFFFFFF;
-    DWORD bytesReturned = 0;
-    BYTE inputBuffer[1024] = { 0 };
-    BYTE outputBuffer[1024] = { 0 };
+                for (DWORD randomIOCTL = 0x00000000; randomIOCTL <= 0xCCCCCCCC; randomIOCTL++) {
+                    std::vector<BYTE> tempInputBuffer = GenerateRandomBuffer(bufferSize);
+                    memcpy(inputBuffer.data(), tempInputBuffer.data(), bufferSize);
 
-    std::cout << "Starting IOCTL fuzzing for driver ID: " << driverID << std::endl;
+                    if (IsIOCTLValid(hDevice, randomIOCTL, inputBuffer, outputBuffer)) {
+                        std::lock_guard<std::mutex> lock(printMutex);
+                        std::wofstream logfile("log.txt", std::ios::app);
+                        if (logfile.is_open()) {
+                            logfile << L"Valid IOCTL command for driver " << driverPath << L": " << randomIOCTL << std::endl;
+                            logfile.close();
+                        }
+                    }
+                }
+            }
+            catch (std::exception& e) {
+                std::lock_guard<std::mutex> lock(printMutex);
+                std::wofstream logfile("log.txt", std::ios::app);
+                if (logfile.is_open()) {
+                    logfile << L"Exception occurred while sending IOCTL commands for driver " << driverPath << L": " << e.what() << std::endl;
+                    logfile.close();
+                }
+                // Handle the exception gracefully, e.g., log the error, recover if possible
+            }
 
-    for (DWORD_PTR address = minAddress; address <= maxAddress; ++address) {
-        // Randomize the input buffer
-        for (size_t i = 0; i < sizeof(inputBuffer); ++i) {
-            inputBuffer[i] = byteDistGlobal(genGlobal);
+            CloseHandle(hDevice);
         }
+        else {
+            std::lock_guard<std::mutex> lock(printMutex);
+            std::wofstream logfile("log.txt", std::ios::app);
+            if (logfile.is_open()) {
+                logfile << L"Failed to open device: " << driverPath << L". Error code: " << GetLastError() << std::endl;
+                logfile.close();
+            }
 
-        if (DeviceIoControl(hDevice, address, inputBuffer, sizeof(inputBuffer), outputBuffer, sizeof(outputBuffer), &bytesReturned, NULL)) {
-            std::cout << "Valid IOCTL command found for driver ID " << driverID << ": " << std::hex << address << std::endl;
+            if (attempt < maxAttempts) {
+                std::wofstream logfile("log.txt", std::ios::app);
+                if (logfile.is_open()) {
+                    logfile << L"Retrying in " << delayMs << L" milliseconds..." << std::endl;
+                    logfile.close();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            }
+            else {
+                std::wofstream logfile("log.txt", std::ios::app);
+                if (logfile.is_open()) {
+                    logfile << L"Maximum number of attempts reached. Skipping driver: " << driverPath << std::endl;
+                    logfile.close();
+                }
+            }
         }
     }
-
-    std::cout << "Finished IOCTL fuzzing for driver ID: " << driverID << std::endl;
-
-    CloseHandle(hDevice);
-}
-
-std::vector<std::string> EnumerateDeviceDriverIDs() {
-    std::vector<std::string> driverIDs;
-
-    HDEVINFO hDevInfo = SetupDiGetClassDevs(NULL, L"DRIVER", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
-    if (hDevInfo == INVALID_HANDLE_VALUE) {
-        throw std::runtime_error("Failed to get device information set.");
-    }
-
-    SP_DEVINFO_DATA devInfoData;
-    devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-    DWORD index = 0;
-    while (SetupDiEnumDeviceInfo(hDevInfo, index, &devInfoData)) {
-        DWORD bufferSize = 0;
-        if (SetupDiGetDeviceRegistryProperty(hDevInfo, &devInfoData, SPDRP_HARDWAREID, NULL, NULL, 0, &bufferSize) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-            ++index;
-            continue;
-        }
-
-        std::vector<TCHAR> buffer(bufferSize / sizeof(TCHAR), 0);
-        if (!SetupDiGetDeviceRegistryProperty(hDevInfo, &devInfoData, SPDRP_HARDWAREID, NULL, reinterpret_cast<PBYTE>(buffer.data()), bufferSize, NULL)) {
-            ++index;
-            continue;
-        }
-
-        std::wstring hardwareID(buffer.data());
-        std::string driverName = GetDriverName(wstring_to_string(hardwareID));
-        if (!IsDriverOwnedByNT(driverName) && !IsDriverSkippable(driverName)) {
-            driverIDs.push_back(wstring_to_string(hardwareID));
-        }
-
-        ++index;
-    }
-
-    if (GetLastError() != ERROR_NO_MORE_ITEMS) {
-        SetupDiDestroyDeviceInfoList(hDevInfo);
-        throw std::runtime_error("Failed to enumerate device driver IDs.");
-    }
-
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-
-    return driverIDs;
 }
 
 int main() {
-    std::vector<std::string> driverIDs;
-    try {
-        std::cout << "Enumerating loaded device driver IDs..." << std::endl;
-        driverIDs = EnumerateLoadedDeviceDriverIDs();
-        std::cout << "Enumeration completed. Total drivers found: " << driverIDs.size() << std::endl;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Error enumerating loaded device driver IDs: " << e.what() << std::endl;
-        return 1;
-    }
+    const size_t maxBufferSize = 2048;
+    LPVOID* drivers = new LPVOID[maxBufferSize];
+    DWORD bytesNeeded;
 
-    for (const std::string& driverID : driverIDs) {
-        try {
-            FuzzIOCTL(driverID);
+    SetUnhandledExceptionFilter(FuzzHandler);
+
+    if (EnumDeviceDrivers(drivers, maxBufferSize * sizeof(LPVOID), &bytesNeeded)) {
+        int driverCount = bytesNeeded / sizeof(drivers[0]);
+
+        std::vector<std::thread> threads;
+
+        for (size_t bufferSize = 0; bufferSize <= maxBufferSize; bufferSize++) {
+            for (int i = 0; i < driverCount; i++) {
+                TCHAR driverPath[MAX_PATH];
+                if (GetDeviceDriverFileName(drivers[i], driverPath, MAX_PATH)) {
+                    threads.emplace_back([driverPath, bufferSize]() {
+                        std::wofstream logfile("log.txt", std::ios::app);
+                        if (logfile.is_open()) {
+                            logfile << L"Testing driver: " << driverPath << L", Buffer Size: " << bufferSize << std::endl;
+                            logfile.close();
+                        }
+                        FuzzDriver(driverPath, bufferSize);
+                        });
+                }
+            }
         }
-        catch (const std::exception& e) {
-            std::cerr << "Error fuzzing IOCTL commands for driver ID: " << driverID << ". " << e.what() << std::endl;
-            // Handle the error as needed
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
+    else {
+        std::wofstream logfile("log.txt", std::ios::app);
+        if (logfile.is_open()) {
+            logfile << "Failed to enumerate device drivers. Error code: " << GetLastError() << std::endl;
+            logfile.close();
         }
     }
 
-    std::cout << "IOCTL fuzzing completed for all driver IDs." << std::endl;
+    delete[] drivers;
 
-    system("pause");
     return 0;
 }
